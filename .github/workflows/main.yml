@@ -1,0 +1,147 @@
+name: RDP 2 - Windows 11 Pro
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    # Requires a real Windows 11 Pro machine with a self-hosted runner.
+    runs-on: [self-hosted, Windows, X64]
+
+    steps:
+      - name: Verify Windows Edition
+        shell: powershell
+        run: |
+          $os = Get-CimInstance Win32_OperatingSystem
+
+          Write-Host "Operating System: $($os.Caption)"
+          Write-Host "Version: $($os.Version)"
+
+          if ($os.Caption -notmatch "Windows 11 Pro") {
+            Write-Error "This machine is not running Windows 11 Pro."
+            exit 1
+          }
+
+      - name: Configure Remote Desktop
+        shell: powershell
+        run: |
+          # Enable Remote Desktop.
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          # Require Network Level Authentication.
+          Set-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1
+
+          # Enable the built-in Remote Desktop firewall rules.
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+
+          # Start the Remote Desktop service.
+          Set-Service -Name TermService -StartupType Automatic
+          Start-Service -Name TermService
+
+          Write-Host "Remote Desktop configured."
+
+      - name: Create RDP Account
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $username = "RDP"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "Set the RDP_PASSWORD GitHub Actions secret."
+          }
+
+          $securePassword = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $existingUser = Get-LocalUser `
+            -Name $username -ErrorAction SilentlyContinue
+
+          if ($existingUser) {
+            Set-LocalUser `
+              -Name $username `
+              -Password $securePassword
+          }
+          else {
+            New-LocalUser `
+              -Name $username `
+              -Password $securePassword `
+              -Description "Remote Desktop account" `
+              -PasswordNeverExpires
+          }
+
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction SilentlyContinue
+
+          Write-Host "RDP account configured."
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+            $installer = "$env:TEMP\tailscale-setup.msi"
+
+            Invoke-WebRequest `
+              -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi" `
+              -OutFile $installer
+
+            Start-Process msiexec.exe `
+              -ArgumentList "/i `"$installer`" /quiet /norestart" `
+              -Wait
+
+            Remove-Item $installer -Force
+          }
+
+      - name: Connect Tailscale
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "Set the TAILSCALE_AUTH_KEY GitHub Actions secret."
+          }
+
+          & $tailscale up `
+            --authkey=$env:TAILSCALE_AUTH_KEY `
+            --hostname=windows11pro-rdp
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Tailscale connection failed."
+          }
+
+          $ip = & $tailscale ip -4
+
+          if (-not $ip) {
+            throw "Could not obtain the Tailscale IP address."
+          }
+
+          Write-Host "Tailscale IP: $ip"
+          Write-Host "RDP username: RDP"
+          Write-Host "Connect using the Windows Remote Desktop client."
+
+      - name: Verify RDP Service
+        shell: powershell
+        run: |
+          $service = Get-Service TermService
+
+          if ($service.Status -ne "Running") {
+            throw "Remote Desktop service is not running."
+          }
+
+          Write-Host "Remote Desktop service is running."
+          Write-Host "Setup completed successfully."
